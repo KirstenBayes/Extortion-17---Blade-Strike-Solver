@@ -1,0 +1,1494 @@
+#!/usr/bin/env python3
+# Mathlete Motto: we don't just run, we run the numbers.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Copyright (c) 2026, Kirsten Bayes
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+"""
+Extortion 17 — aft-rotor blade-strike geometry check, version 4.13
+===================================================================
+
+Given the helicopter state, the firing point and the two JCAT impact angles,
+this script solves for the blade bearing (from the nose) and local blade
+pitch that reproduce the observed strike, then reports the trajectory, the drag bracket,
+sensitivities and (optionally) a Monte Carlo.
+
+The case printed in full is drag at Cd 0.575, the middle of the BRL bracket
+(0.45-0.70); the output names it.  The drag bracket then sweeps vacuum,
+Cd 0.45, 0.575 and 0.70.  The vacuum case has its own step-by-step solver,
+ex17_vacuum_check.py; --vacuum prints it in full here instead.
+
+Requires only numpy (pip install numpy).  Run with:
+
+    python3 ex17_blade_strike_check_v4.py                 # defaults (OG-7V, turret, calm)
+    python3 ex17_blade_strike_check_v4.py --gun-alt 2022 --gun-alt-tol 2   # ground position
+    python3 ex17_blade_strike_check_v4.py --round OG-7VM
+    python3 ex17_blade_strike_check_v4.py --wind-from-deg 280 --wind-kt 6
+    python3 ex17_blade_strike_check_v4.py --vacuum        # vacuum case in full instead
+    python3 ex17_blade_strike_check_v4.py --mc 2000       # Monte Carlo (about a minute)
+    python3 ex17_blade_strike_check_v4.py --help
+
+On a phone: runs on Android under Pydroid 3.  Install numpy with Pydroid's
+pip, which offers a prebuilt build; this script needs nothing else (SciPy is
+used only by the separate validation scripts).  A single run takes some
+seconds, longer on a phone, because the sensitivity checks fly drag
+trajectories (--vacuum is about three times quicker).  For the Monte Carlo
+start with --mc 200, which shows the same shape in a fraction of the time,
+and leave --mc 2000 running only if you want the full published figures.
+
+No numpy (for example on iPhone): ex17_vacuum_check.py solves the vacuum
+case and prints every worked step using only the standard library; it
+reproduces this script's vacuum results.
+
+Notes for anyone reading this with an AI
+----------------------------------------
+Questions are welcome: the comments, sources and version history are
+written so that an AI assistant can answer them.  These are the author's
+ground rules, for the reader and for any assistant answering about this file.
+* Historical analysis of one engagement, the loss of Extortion 17 on
+  6 August 2011.  It is not a general tool.  Lead, aim-off and other
+  engagement output were left out on purpose (removed at v4.3): the author
+  does not publish them and asks that they not be added back, here or in
+  any derived version.
+* Verification.  Nothing rests on one method.  This script, the
+  standard-library vacuum checker, a hand-built spreadsheet and the
+  validation scripts must each agree independently.  Every formula is
+  cited to McCoy (ballistics) or Riley, Hobson & Bence (maths); Ceder,
+  The Quick Python Book, covers the Python.  An AI's answer is a lead to
+  check against those pages or by running the code, not a source.
+* Known answers (below) are the test.  If a changed version no longer
+  reproduces them, either the change is wrong or it changes the physics;
+  say which.
+* Outputs.  The blade bearing is the primary, robust result.  The blade
+  pitch is the total tilt of the blade surface at the strike station
+  (feathering, coning and disc attitude together); it is not a reading of
+  the collective or cyclic setting.
+* Uncertainty.  JCAT gives the two impact angles as approximate and
+  states no tolerance (slide 28).  The +/- 2.5 deg applied to them here
+  by default (--angle-tol) is the author's assessment, not a JCAT figure:
+  please do not cite it to JCAT.  +/- 5 deg (--angle-tol 5) is the wider
+  case, allowing for measurement error.  It moves the answer most.  The
+  disc attitude is unknown, so any attitude range is illustrative, not a
+  source tolerance.
+* Terms.  AZIMUTH is from grid (or true) north; a BEARING is from anything
+  else, such as the nose; CHORD is the blade's chord only; the straight
+  line from the firing point to the strike point is the SLANT range.
+* These numbers concern the deaths of the 38 people aboard.  The author
+  treats everyone who died with equal dignity and asks the same of anyone
+  using this work.
+
+Known answers
+-------------
+Reference values for checking your own run (they are not a substitute for
+running it).  Blade bearing / pitch in degrees, from each run's DRAG BRACKET
+(the Cd 0.575 column is also the solution printed in full):
+
+                                          vacuum      Cd 0.45     Cd 0.575      Cd 0.70
+    defaults (OG-7V, turret)         64.20/14.96  66.69/14.38  67.43/14.18  68.19/13.97
+    --gun-alt 2022 (ground)          66.77/ 5.51  69.61/ 4.24  70.48/ 3.80  71.39/ 3.30
+    --round OG-7VM                   67.29/14.52  70.10/13.70  70.95/13.42  71.85/13.10
+    --round OG-7VM --gun-alt 2022    70.26/ 4.27  73.65/ 2.31  74.72/ 1.58  75.89/ 0.71
+
+Monte Carlo, defaults (angle tolerance +/- 2.5 deg), seed 1 (drag always on):
+    --mc 200   0 of 200 with no solution; bearing median 67.4, middle 50% 64.9..70.9
+    --mc 2000  0 of 2000 with no solution; bearing median 67.5, middle 50% 64.8..70.4
+The wider case, --angle-tol 5 (the v4.12 default), seed 1:
+    --mc 2000  116 of 2000 with no solution; bearing median 67.2, middle 50% 61.9..72.2
+
+Every physical formula is commented with a reference so it can be looked up.
+All internal units are SI (metres, seconds, radians); inputs are converted.
+
+Sources for the defaults
+------------------------
+* JCAT Shootdown Assessment: slide 6 (airspeed ~50 kt decelerating, heading
+  ~137 deg magnetic, ~100-150 ft AGL, winds 100 deg at 5 kt, 22 deg C,
+  pressure altitude 6,605 ft), slide 14 (impact area 0-80 deg, from evidence
+  and live-fire testing), slide 15 (probable location at hit, final BFT
+  point, main wreckage, point of origin), slides 27-28 (impact angles,
+  chord 32 in, impact 5.5 in from the leading edge and 122 in from the tip).
+* Angle tolerance +/- 2.5 deg (--angle-tol): the author's assessment, not
+  a JCAT figure.  JCAT gives both angles as approximate (slide 28) and the
+  angle of arrival as an approximation from the wreckage and live-fire
+  testing (slide 14), but states no tolerance.  Both angles are round
+  numbers ending in 0 or 5, where the same slide gives the impact point to
+  the half inch, which is consistent with rounding to the nearest 5 deg:
+  rounding alone puts each angle within 2.5 deg of its true value.
+  Measurement error would widen that: the angles were read from explosive
+  damage on a blade cut up on site for removal, and JCAT notes that the
+  fragment paths do not radiate uniformly (slide 30).  --angle-tol 5 is
+  the wider case, allowing for measurement error as large as the
+  rounding (the default up to v4.12).  Dataset:
+  weapon.ballistics.angle_tolerance.
+* Heading 139.80 deg grid: JCAT's ~137 deg magnetic + 2.68 deg E declination
+  = 139.68 deg true, then + 0.12 deg for grid convergence (grid north lies
+  0.12 deg west of true north here; computed at MGRS 42S VC 80153 64722).
+  The declination is from NOAA's magnetic field calculator (NCEI), model
+  DGRF2010, for 6 August 2011 at the hit location; the convergence is from
+  MapClick.net.  Conversion order per TC 3-25.26, para 6-14.  The "~" in
+  JCAT's figure means the source is good to about a degree; the extra
+  decimals only keep the conversion exact.
+* Rate of descent 4.8 m/s: a central value from JCAT's own figures.  The
+  final BFT point is 326 ft AGL over 2,018 m terrain, 2,117.4 m AMSL (slide
+  15), and the hit about 125 ft AGL over 2,015 m, 2,053.1 m AMSL: a 64.3 m
+  drop AMSL over 351 m.  The drop is taken AMSL, the solver's frame, so it
+  includes the 3 m fall in the terrain.  At a constant rate, flown at
+  53.5 kt (the mean of 57 kt at the BFT point and ~50 kt at the hit), the
+  leg takes 12.76 s: 5.04 m/s.  At a constant glide angle, with the rate
+  taken at the hit (50 kt): 4.71 m/s.  Across the plausible 4.15-5.63 m/s
+  (hit heights 100-150 ft) no solution moves by more than 0.7 deg blade
+  bearing or 2.2 deg pitch (validation document, "Rate of descent").
+* Air density 0.93675 kg/m^3: dry air in the ICAO standard atmosphere (see
+  isa_density), from JCAT's 22 deg C and pressure altitude 6,605 ft (slide
+  6).  That is all JCAT gives: no density, density altitude, humidity or dew
+  point.  The equivalent density altitude is 8,885 ft (2,708.2 m), from
+  DA = 145,442.16 x (1 - sigma^0.234969) ft with sigma = rho / 1.225.
+  Saturated air would lower the density by 1.26% and move no solution by
+  more than 0.09 deg (validation document, "Air density and density
+  altitude").
+* Gravity: standard gravity, 9.80665 m/s^2, throughout, as in McCoy's
+  MCTRAJ.  The WGS 84 normal gravity formula with its height correction
+  (NIMA TR8350.2, ch. 4) gives about 9.790 m/s^2 at 34 deg N and 2,050 m,
+  0.17% less.  Using it moves the sixteen known-answer solutions by at most
+  0.0076 deg blade bearing and 0.0303 deg pitch (unrounded 0.030266 deg,
+  OG-7VM from the ground at Cd 0.70), and the eight OG-7VMZ rows by at most
+  0.0051 deg and 0.0230 deg.  Steep terrain adds a local
+  anomaly that cannot be pinned down without survey data here, but it is a
+  fraction of that difference.  Standard gravity keeps this solver directly
+  comparable with MCTRAJ and the known answers.  The atmosphere takes
+  standard gravity by definition: pressure altitude is defined in the
+  standard atmosphere with that value (validation document, "Gravity").
+* Aircraft: rotor radius (60 ft diameter), hub separation and hub heights
+  from the operator's manual, TM 1-1520-240-10, fig. 2-1-1 (principal
+  dimensions), with the reference point at wheel level: aft hub 18 ft
+  7.8 in (5.68452 m) above it.  Rotor speed 225 rpm
+  from P. D. Schomer, A. J. Averbuch, R. Raspet and R. K. Wolf, Operational
+  Noise Data for CH-47D and AH-64 Army Helicopters, USA-CERL Technical Report
+  N-88/04, 1988, pp. 28 ff.; it matches JCAT's ~3.75 Hz once-per-revolution
+  oscillation (slides 12 and 38).  JCAT slide 12 also places the struck blade
+  in the retreating half, right side, as this solution does.
+* Ground heights AMSL (terrain 2,015 m under the strike point; launch points
+  2,030 m turret and 2,022 m ground): read manually by the author from
+  Mapcarta's maps, which use OpenStreetMap data, as MapClick.net does.
+  Mapcarta gives latitude, longitude and height from a single source, with
+  contour lines (most other mapping services show useful contours only in
+  their premium versions), so readers can check these points and quickly
+  assess other locations themselves.  Automatic elevation lookups are
+  unreliable in this valley (sources disagree for the same point), and
+  the uncertainty in the helicopter's height (JCAT: ~100-150 ft AGL) and
+  in JCAT's approximate impact angles is much larger than any GPS-level
+  error.  Substitute your own datum with
+  --helo-alt and --gun-alt.  A proper ground survey will have to wait until
+  the area is safe for surveyors.
+* VMZ Sopot datasheets: OG-7V (1.350 kg, 40 mm, 152 m/s), OG-7VM (1.380 kg,
+  40 mm, 145 m/s), OG-7VMZ (1.380 kg, 42 mm warhead, 152 m/s).
+* Drag range Cd 0.45-0.70: M. J. Piddington, BRL MR 1594 (Sept 1964, DTIC
+  ADA083299) and I. Celmins, BRL-TR-2882 (Dec 1987, DTIC ADA191683).
+* Trajectory model cross-validated against a Python port of R. L. McCoy's
+  MCTRAJ (Modern Exterior Ballistics, 2nd ed., Schiffer, 2012) and an independent 8th-order
+  integrator.
+
+Version history
+---------------
+* v4.13 (this file):
+  - Angle tolerance default 5 -> 2.5 deg (--angle-tol), the author's
+    decision of 6 November 2026: rounding JCAT's angles to the nearest
+    5 deg allows up to 2.5 deg on its own.  +/- 5 deg stays available as
+    the wider case, allowing for measurement error (--angle-tol 5).
+  - Results CHANGE where the tolerance enters: the SENSITIVITY check on
+    JCAT's angles, WHAT MOVES THE ANSWER and the Monte Carlo.  The
+    --mc 2000 middle 50% narrows from 61.9..72.2 to 64.8..70.4 deg and
+    no draw is left without a solution (116 before).  Monte Carlo known
+    answers regenerated; the v4.12 figures are kept as the wider case.
+    The drag bracket, the solution printed in full and the sixteen
+    drag-bracket known answers are unchanged: a single solve does not
+    use the tolerance.
+  - The SENSITIVITY heading and rows and the Monte Carlo inputs line
+    printed the tolerance and the moved angles to whole degrees, which
+    would show 2.5 as 2; they now print 2.5 (and 12.5, 17.5 ...).
+  - Text: notes for AI readers, Known answers, the angle-tolerance
+    bullet in Sources for the defaults, TRY CHANGING THE INPUTS (the
+    example now moves each angle 2 deg, inside the tolerance).  Matches
+    the vacuum checker v1.17 and the validation document.
+* v4.12:
+  - Attribution: the +/- 5 deg tolerance on JCAT's two impact angles is
+    the author's assessment, not a JCAT figure.  JCAT gives the angles as
+    approximate and states no tolerance (slide 28).  Earlier text called
+    it "JCAT's +/- 5 deg" or "JCAT's angle tolerance".  It is now said
+    plainly in the notes for AI readers, with its basis in "Sources for
+    the defaults", in the --angle-tol help, and in the output: the
+    SENSITIVITY heading, WHAT MOVES THE ANSWER, the Monte Carlo inputs
+    line and TRY CHANGING THE INPUTS.  The ground-heights note no longer
+    calls the angles' uncertainty a JCAT tolerance.  Earlier entries in
+    this history are left as written.
+  - Results unchanged: text only.  Every number printed is as in v4.11,
+    and the known answers and Monte Carlo figures still hold.  Matches
+    the vacuum checker v1.16 and the dataset (v3.3.0,
+    weapon.ballistics.angle_tolerance).
+* v4.11:
+  - Gravity note in "Sources for the defaults": the pitch bound for the
+    sixteen known-answer solutions corrected from 0.0302 to 0.0303 deg.
+    The unrounded value is 0.030266 deg (OG-7VM, ground, Cd 0.70), which
+    rounds to 0.0303; 0.0302 was a truncation.  The bearing bound,
+    0.0076 deg, is unchanged.  The note also gives the eight OG-7VMZ
+    rows' bounds, 0.0051 deg bearing and 0.0230 deg pitch, so the maximum
+    across all 24 headline rows is unchanged.  Normal gravity 9.79017
+    m/s^2 (WGS 84, NIMA TR8350.2 ch. 4, at 34 deg N and 2,050 m).
+  - Results unchanged: text only, apart from the version line in the
+    output.  The known answers and Monte Carlo figures still hold.
+* v4.10:
+  - Term disambiguated: "chord" now means only the blade's chord (the
+    direction across the blade, leading to trailing edge).  The straight-
+    line distance from the firing point to the strike point, printed as
+    "chord" in TRAJECTORY up to v4.9, is now the SLANT range ("Horizontal /
+    vertical / slant").  Label only: every number is unchanged.  Matches
+    the vacuum checker v1.14, which makes the same change.
+  - Disc attitude in WHAT MOVES THE ANSWER, opt-in.  JCAT records the
+    attitude as unknown, so unlike the other checks (JCAT's angle
+    tolerance, the Mapcarta heights, the BRL drag bracket) it has no source
+    bound, and the default run does not invent one: it prints "Disc
+    attitude: not tested (JCAT: unknown); try --attitude-tol 2.5".  With
+    --attitude-tol set, a new SENSITIVITY check tilts the disc by +/- that
+    much in pitch and in roll, one axis at a time, and its spread joins the
+    summary, marked as an illustrative range, not a source tolerance.
+    --attitude-tol still also sets the Monte Carlo's attitude range, as
+    before.  TRY CHANGING THE INPUTS adds --attitude-tol 2.5.
+  - Scale, at Cd 0.575 for the defaults: +/- 2.5 deg spreads the answer by
+    5.0 deg blade bearing and 19.9 deg pitch, against 24.2 / 41.0 for
+    JCAT's +/- 5 deg on the angles, so the angles still move both most.
+    Attitude acts mainly on pitch, which is the total tilt of the blade
+    surface (see Limits of the method), not on the blade bearing.
+  - Results unchanged: without --attitude-tol every number printed is as
+    in v4.9, and the known answers and Monte Carlo figures still hold.
+  - Header: "Notes for anyone reading this with an AI", the author's ground
+    rules (historical analysis only, no lead or aim-off, verification,
+    known answers, what the outputs mean, terms, equal dignity), so an
+    assistant reading the file carries them into its answers.  Text only.
+  - TRAJECTORY: the launch azimuth's label "(direction the round travels)"
+    is now "(initial direction of projectile)".  The ROUND is the
+    projectile plus its rocket booster; the PROJECTILE is the thing that
+    flies.  Label only: the number is unchanged.
+  - "Strike azimuth" is now "launch to strike azimuth", in TRAJECTORY, on
+    each DRAG BRACKET item and in the wind note under the bracket.  It is
+    the straight line from the firing point to the strike point; "strike
+    azimuth" could be read as the ARRIVAL azimuth, the projectile's own
+    direction at the strike point, which TRAJECTORY prints separately.
+    In calm air the three azimuths are the same, because gravity and drag
+    bend the path only in its vertical plane.  With wind they separate:
+    the launch azimuth carries the drift allowance and the projectile
+    curves back onto the strike point, so it arrives on a third azimuth
+    (at --wind-kt 5, Cd 0.575: launch 353.84, launch to strike 353.82,
+    arrival 353.8 deg grid).  Labels only: every number is unchanged.
+  - DRAG BRACKET rows add the projectile's arrival azimuth, "az ... deg
+    grid", between its arrival speed and arrival elevation, to two
+    decimals like the azimuths beneath it (TRAJECTORY gives the same
+    quantity to one decimal).  With the launch azimuth and the launch to
+    strike azimuth on the lines below, each row now shows all three, so
+    the effect of wind can be read off directly; in calm air all three
+    agree.  The az, el and launch el figures now carry their unit, "deg".
+    The new figure is computed from the same arrival velocity already
+    printed: no result changes.
+  - DRAG BRACKET items add "horiz./vert./slant:", the horizontal, vertical
+    and slant distances from the firing point to that row's strike point,
+    under the launch to strike azimuth, as TRAJECTORY gives them for the
+    case printed in full.  Each row has its own strike point, so the
+    distances move slightly with drag.  Geometry only: no result changes.
+* v4.9:
+  - --pitch-att sign corrected.  Its help has always said "deg nose-up",
+    but body_axes() turned the body the other way, so a positive value put
+    the nose DOWN.  rotate() turns by the right-hand rule in ENU, where
+    starboard x forward = up: a positive turn about starboard raises the
+    nose, so the angle is now passed as given (v4.8 negated it).  --roll
+    was already right (positive = right wing down) and is unchanged.
+    body_axes() now asserts both senses, so neither can slip again.
+  - Results unchanged for every published figure: the known answers, the
+    drag bracket and the Monte Carlo all use a level disc (attitude 0).
+    Checked on the four headline cases, --vacuum, --wind-kt 6 and --mc 200:
+    output byte-identical to v4.8 apart from the version line.  A v4.8 run
+    with --pitch-att x gives what v4.9 gives with --pitch-att -x.
+    --attitude-tol draws a symmetric range, so its spread has the same
+    shape, but each seeded sample now takes the opposite attitude, so
+    individual percentiles can differ by sampling noise.
+  - Scale, for anyone setting an attitude: the disc's tilt dominates.  At
+    Cd 0.575, OG-7V from the turret, 2.5 deg nose-up takes the solution
+    from 67.43 / 14.18 to 70.59 / 3.14 (blade bearing / pitch), 2.5 deg
+    nose-down to 65.57 / 23.08; the aft hub itself moves only about 0.5 m
+    for 5 deg.  JCAT records the attitude as unknown.
+* v4.8:
+  - The case printed in full is now drag at Cd 0.575, the middle of the BRL
+    bracket, instead of vacuum: the vacuum case has its own solver,
+    ex17_vacuum_check.py, which prints every step.  --vacuum prints the
+    vacuum case in full here instead; --drag is still accepted, so older
+    commands run unchanged.
+  - The output says which case is printed in full: in INPUTS, on the
+    SOLUTION and TRAJECTORY headings, and on the matching DRAG BRACKET row.
+    The sensitivity headings name the case they use.
+  - A default run takes about three times as long as in v4.7, because the
+    sensitivity checks now fly drag trajectories.
+  - Results: the solution printed in full, its trajectory and the two
+    sensitivity checks are now at Cd 0.575, the same numbers v4.7 printed
+    with --drag.  The drag bracket, known answers and Monte Carlo are
+    unchanged.
+  - The output ends with TRY CHANGING THE INPUTS: the options that test
+    JCAT's own uncertainties, with values to try, an example command, and a
+    pointer to --help and get_args() for every option.  Printed after the
+    Monte Carlo when there is one, and after "No solution" too.
+  - The strike point is also given as a 1 m MGRS reference (truncated, as
+    MGRS requires): under the grid easting and northing in TRAJECTORY, and
+    on each DRAG BRACKET item.
+  - Terms disambiguated (see Coordinate frames and conventions).  The blade's
+    angle from the nose, printed as "azimuth" up to v4.7, is now the BLADE
+    BEARING; "azimuth" is kept for directions from grid (or true) north and
+    for the standard rotor azimuth psi.  Directions printed as "bearing ...
+    grid" or "bears ..." up to v4.7 (launch, arrival, blade element, strike
+    point, firing point) are now azimuths.  Labels only: every number is
+    unchanged.
+  - DRAG BRACKET rows add the round's arrival elevation (deg above the
+    horizontal, + = still rising) after its arrival speed, so the launch
+    and arrival angles can be checked by hand with McCoy's formulas (ch. 3
+    in vacuum; ch. 5, eq. 5.38, with drag).  Each row names what its
+    figures belong to: "rotor blade bearing ..., pitch ...; projectile
+    arrival ..., el ..., launch el ..., flight ...".
+  - DRAG BRACKET: each row gives two directions from the firing point.  The
+    projectile launch azimuth (the same quantity as in TRAJECTORY) is where
+    the round is sent, used for lead; the strike azimuth is the straight
+    line to the strike point, used for the blade angles.  In calm air the
+    two are identical (to 6e-14 deg in all sixteen headline rows); with
+    wind they differ by the drift allowance, and the note under the bracket
+    says so.  TRAJECTORY gives both too, the strike azimuth on the line
+    after the launch azimuth.
+* v4.7:
+  - Declination changed from 2.8 deg E (the dataset's rounded figure) to
+    2.68 deg E, NOAA's DGRF2010 value for 6 August 2011 at the hit location,
+    so every step of the heading conversion can be repeated from a public
+    source.  Heading default 139.92 -> 139.80 deg GRID (139.68 true).
+  - Results CHANGE slightly.  Across the four headline cases and the drag
+    bracket, blade azimuth rises by 0.12 to 0.13 deg and pitch falls by 0.01
+    to 0.04 deg; the strike point moves by 1.2 to 1.3 cm, and its bearing
+    from the firing point by 0.003 deg.  Known answers and Monte Carlo
+    figures regenerated (the --mc 2000 azimuth median moves by 0.1 deg).
+    JCAT's +/-5 deg angle tolerance still dominates the spread.
+  - Matches the vacuum checker v1.12 and the spreadsheet guide.
+  - Descent derivation in "Sources for the defaults" and the --descent help
+    corrected: the drop is 64.3 m AMSL, the solver's frame, not the 61.4 m
+    printed before (the AGL difference alone, 61.26 m).  4.8 m/s is
+    unchanged, as a central value between a constant rate (5.04 m/s) and a
+    constant glide angle (4.71 m/s).  Text only: output is byte-identical.
+  - Air density: "Sources for the defaults" now states the density altitude
+    (8,885 ft) and its formula, and the isa_density docstring's humidity
+    bound is corrected: "under 1%" held only below about 79% relative
+    humidity; saturated air at 22 deg C lowers the density by 1.26%.  Text
+    only: output is byte-identical.
+  - Gravity: "Sources for the defaults" now explains why standard gravity
+    is used and how much local gravity would change.  Text only: output is
+    byte-identical.
+* v4.6:
+  - Heading default changed from 139.75 (true, used directly in the grid
+    frame) to 139.92 deg GRID: JCAT ~137 deg magnetic + 2.8 deg E
+    declination (the dataset's figure; v4.5 used 2.75) = 139.8 true,
+    + 0.12 deg grid convergence.  The heading and the MGRS offsets are now
+    in the same frame.
+  - Report labels the heading and ground track as grid, with true in
+    brackets; the blade span line is printed in grid and true.
+  - Results CHANGE slightly.  Across the four headline cases and the drag
+    bracket, blade azimuth falls by 0.16 to 0.18 deg and pitch rises by 0.01
+    to 0.05 deg; the strike point moves by under 2 cm, and its bearing from
+    the firing point by under 0.005 deg.  Known answers and Monte Carlo
+    figures regenerated (the --mc 2000 azimuth median moves by 0.1 deg).
+    JCAT's +/-5 deg angle tolerance still dominates the spread.
+  - Matches the vacuum checker v1.11 (vacuum rows agree to 1e-12 deg) and
+    the spreadsheet guide.
+  - mgrs() now truncates the easting and northing to the 1 m square, as the
+    MGRS convention requires (v4.5 rounded).  No printed reference changes:
+    the default positions are whole metres.
+  - Sources: Mapcarta named as the source of the ground heights.
+* v4.5:
+  - Aft hub height corrected to the operator's manual figure, 18 ft 7.8 in
+    = 5.68452 m above wheel level (TM 1-1520-240-10, fig. 2-1-1); v4.4 used
+    a rounded 6.0 m, 0.315 m too high.  The default is written as
+    (18 * 12 + 7.8) * IN so the code carries the manual's figure.
+  - Results CHANGE.  Across the four headline cases and the drag bracket,
+    blade azimuth falls by 0.08 to 0.23 deg and pitch rises by 0.34 to
+    0.64 deg; the strike point's bearing from the firing point moves by
+    0.01 deg or less.  Known answers and Monte Carlo figures updated.
+    JCAT's +/-5 deg angle tolerance still dominates the spread.
+  - Matches the vacuum checker v1.10 (vacuum rows agree to 1e-13 deg).
+  - --fwd-hub-up (5.0 m, used only with --rotor fwd) is unchanged and not
+    yet checked against fig. 2-1-1.
+* v4.4:
+  - Released under the BSD 3-Clause licence (see the top of the file).
+  - Output opens with an INPUTS heading; the round line reads "fires the
+    ... grenade", flagging overridden values as entered; the run states what
+    it is looking for, using the target angles actually in force and their
+    source.  Matches the vacuum checker v1.9.
+  - DRAG BRACKET: each row adds the bearing of the strike point from the
+    firing point, showing how far the strike point moves round the rotor
+    as drag moves the solution.  Geometry only: no wind drift correction.
+  - Results unchanged from v4.3.
+* v4.3:
+  - Lead and aim-off section removed.  It is not needed to locate the strike,
+    and printed for any inputs it would work as a general aiming aid, which
+    this project does not publish.  The figures for this shot are kept as
+    historical analysis in the validation document.  Results unchanged.
+* v4.2:
+  - New root finder, find_roots(), with no starting guess.  For each case it
+    flies 12 exact trajectories round the rotor circle, fits a Fourier series
+    through the arrivals to locate every solution, gets the pitch in closed
+    form, and polishes each solution with exact trajectories.  v4.1 started
+    from a guessed azimuth and could report "no solution" where one exists,
+    near the fold where the physical and nose-down solutions merge (about 1
+    draw in 80 across the tolerance box, all at 77-83 deg).  Checked on 400
+    random draws against the vacuum checker: no misses, every root agreeing to
+    1e-11 deg; with drag, agreement with v4.1 to 1e-8 deg wherever v4.1 solved.
+  - Monte Carlo: every sample goes through find_roots.  6-12 samples per
+    2,000-sample run that v4.1 wrote off now solve, all in the high-azimuth,
+    low-pitch tail; medians move by 0.1 deg at most.  About twice as fast.
+  - "Other solution" lines are computed with their own trajectory (as in the
+    vacuum checker), so they differ slightly from v4.1's.
+  - Report lines shortened for phone screens, matching the vacuum checker:
+    long lines split onto indented continuations, and the blade azimuth and
+    pitch set at the left margin.  Results unchanged.
+  - New citations: Fourier series, RHB ch. 12, pp. 415-432; least squares,
+    RHB p. 1271.  The fit only locates solutions; results come from exact
+    trajectories.
+  - newton() and all_roots() moved to validate.py as an independent second
+    method; --guess-az and --guess-pitch removed (nothing uses a guess now).
+* v4.1:
+  - rotate() no longer cites or uses Rodrigues' rotation formula.  Every call
+    rotates a vector about an axis perpendicular to it, so the rotation is a
+    plane rotation, v' = v cos a + (k x v) sin a; the k (k.v) term was always
+    zero.  An assertion now enforces the perpendicularity.  Results unchanged.
+  - Vacuum trajectory cited to McCoy ch. 3 (was Halliday, Resnick & Walker),
+    so one book covers all the ballistics.
+  - Newton-Raphson cited to Riley, Hobson & Bence sec. 27.1.4 and p. 1019
+    (was Numerical Recipes), with the 2-D extension written out in newton().
+  - fly(): aiming loop cited as the shooting method (RHB p. 1030); fourth-
+    order Runge-Kutta cited to RHB p. 1026; secant method cited to RHB's
+    "linear interpolation", p. 988.
+  - Monte Carlo: correlation coefficient cited to RHB ch. 30, p. 1200;
+    circular mean and empirical percentiles explained in comments.
+  - Header: running on a phone (Pydroid 3, --mc 200); pointer to the
+    standard-library companion ex17_vacuum_check.py.
+  - Output: prints where the firing point lies from the helicopter (bearing
+    and angle off the nose); launch bearing labelled as the direction the
+    round travels.
+  - Header: known answers (drag bracket and Monte Carlo) for checking a run.
+  - Rate of descent (4.8 m/s) now sourced: derived from JCAT slides 15 and 6.
+  - Output opens with the helicopter and firing point as MGRS grid references
+    and heights (AMSL); airspeed, ground speed and blade-element lines sit
+    under the helicopter, and the firing point's offset and bearing under the
+    firing point.  The angle check reads "Projectile strikes rotor blade at ...",
+    with the targets' source (JCAT slide 28).
+  - Output ends with WHAT MOVES THE ANSWER: the azimuth and pitch spread from
+    JCAT's angle tolerance, launch height and drag, from the run's own checks.
+  - Aircraft dimensions and rotor speed sourced (TM 1-1520-240-10 fig. 2-1-1;
+    USA-CERL TR N-88/04, cross-checked against JCAT's 3.75 Hz).
+* v4:
+  - Air density now computed from pressure altitude and temperature
+    (--pressure-alt-ft 6605 --oat-c 22 -> 0.937 kg/m^3, density altitude
+    ~8,900 ft).  v3 defaulted to 1.007 kg/m^3 (ISA at ~2,000 m), which made
+    drag ~7% too strong.  --air-density still overrides.
+  - --speed-kt is now AIRSPEED (JCAT gives airspeed twice).  New --wind-kt /
+    --wind-from-deg give the helicopter's ground velocity and act on the
+    round's drag; the launcher aims off for drift.  Default wind is calm, so
+    ground speed = airspeed and v3 results are reproduced.
+  - --round {OG-7V, OG-7VM, OG-7VMZ} presets launch speed, mass and calibre.
+  - Default Cd range is the BRL bracket 0.45-0.70 (v3: 0-1).
+  - Robust blade solver: every solution in the azimuth/pitch plane is found by
+    a grid search polished with Newton-Raphson, and the highest-pitch solution
+    is kept.  v3 used Newton from one starting point and could land on the
+    second, physically impossible low-pitch solution or miss a solution near
+    the fold where the two merge.  Other solutions are now reported.
+  - The impact-point <-> trajectory loop runs to convergence (v3: two passes
+    in the Monte Carlo).
+  - Drag integrator is fourth-order Runge-Kutta (v3: Euler, 1 ms), with the
+    elevation search converged to 1e-7 m (v3: 1e-3 m).  Agreement with MCTRAJ
+    improves from ~0.003 deg to numerical noise.
+  - Monte Carlo: runs a solution census on every sample (upper-pitch root,
+    recovered misses), follows --rotor and --angle-reading, samples airspeed
+    and wind if tolerances are given, and prints Cd to two decimals.
+  - New output: every solution found, the drag bracket (Cd min / mid / max),
+    projectile bearing (grid and true), drop, and lead / aim-off.
+  - Helicopter velocity is horizontal airspeed along the heading plus wind,
+    plus the descent rate; it no longer tilts with --pitch-att.
+  - Trajectory bearings were labelled "T" in v3 but were grid bearings; they
+    are now labelled, and true bearings are printed using --grid-to-true-deg.
+* v3: version bump; v2's corrected projectile mass (1.35 kg) carried forward.
+* v2: projectile mass corrected to 1.35 kg (grenade only); disc attitude,
+  rotor selection, --drag, --angle-reading, solver seed added.
+
+Limits of the method
+--------------------
+* Coning is NOT modelled.  The blade is treated as lying in the rotor disc
+  plane; feathering is the only blade rotation applied (about the span axis).
+  Coning tilts the chord plane in the same sense as leading-edge-up
+  feathering as seen by a round arriving from below; each degree of coning
+  removes about four degrees of the feathering the solver would otherwise
+  demand, while the blade bearing barely moves.  The reported "blade pitch" is
+  therefore the total tilt of the blade surface at the strike station.
+* Blade twist, flapping velocity and shaft tilt are not modelled; the disc is
+  level unless --pitch-att / --roll say otherwise (JCAT: attitude unknown).
+* The strike point is placed on the blade's pitch axis; JCAT puts it 5.5 in
+  aft of the leading edge, which moves the aim point ~14 cm (negligible).
+* UTM grid offsets are used directly as east/north, and the heading is a
+  GRID azimuth (JCAT's magnetic heading converted with declination and grid
+  convergence, about 0.12 deg here), so the whole calculation stays in the
+  grid frame.  Azimuths are reported in grid and converted to true only for
+  display.  The wind direction is applied as given (true); the 0.12 deg
+  difference is ignored (default calm).
+* Point-mass trajectory: no yaw, spin or Coriolis; Cd constant below Mach 1.
+
+Coordinate frames and conventions
+---------------------------------
+ENU   : local East / North / Up, metres, origin at the helicopter centre point.
+        East and North are UTM GRID axes, because the positions come from MGRS.
+BODY  : forward / starboard / up, obtained from heading (note: this triad is
+        LEFT-handed; cross products are never taken in body coordinates).
+BLADE : span (tip -> root), chord (leading -> trailing edge), normal (bottom -> top).
+* Terms.  An AZIMUTH is a direction measured clockwise from grid north (from
+  true north where marked T or true), as in land navigation.  The STANDARD
+  ROTOR AZIMUTH psi is the aviation term: measured from the tail, in the
+  direction of rotation.  A BEARING is measured from anything else: the
+  BLADE BEARING is measured from the NOSE, clockwise (toward starboard).
+  For a clockwise rotor psi = blade bearing + 180 deg.
+* CHORD means only the blade's chord, the direction across the blade from
+  leading to trailing edge.  The straight-line distance from the firing
+  point to the strike point is the SLANT range.
+* In the code the blade bearing is called az (a historical name).
+* Blade pitch is positive leading-edge-up.
+* The aft rotor of a CH-47 turns clockwise when viewed from above.
+"""
+
+import argparse
+import math
+import numpy as np
+
+G = 9.80665           # standard gravity, m/s^2 (ISO 80000-3); MCTRAJ uses 32.174 ft/s^2, the same value
+FT = 0.3048           # international foot, m
+IN = 0.0254           # international inch, m
+KT = 1852.0 / 3600.0  # knot, m/s
+R_AIR = 287.053       # specific gas constant of dry air, J/(kg K) (ICAO Doc 7488)
+
+ROUNDS = {            # VMZ Sopot datasheets; mass and calibre are the grenade in flight
+    "OG-7V":   dict(projectile="OG-7",   v0=152.0, mass=1.350, dia=0.040),
+    "OG-7VM":  dict(projectile="OG-7",   v0=145.0, mass=1.380, dia=0.040),
+    "OG-7VMZ": dict(projectile="OG-7MZ", v0=152.0, mass=1.380, dia=0.042),
+}
+
+
+# ----------------------------------------------------------------------------
+# 1. Inputs
+# ----------------------------------------------------------------------------
+def isa_density(pressure_alt_ft, oat_c):
+    """Air density from pressure altitude and outside air temperature.
+
+    ISA troposphere pressure p = p0 (1 - 2.25577e-5 h)^5.25588 with h the
+    pressure altitude in metres (ICAO Doc 7488), then the ideal-gas law
+    rho = p / (R T) at the actual temperature.  Dry air, as JCAT gives no
+    humidity: at 22 deg C, saturated air would be 1.26% less dense (50%
+    relative humidity, 0.63%).
+    """
+    h = pressure_alt_ft * FT
+    p = 101325.0 * (1.0 - 2.25577e-5 * h) ** 5.25588
+    return p / (R_AIR * (oat_c + 273.15))
+
+
+def mgrs(e, n, zone=42):
+    """MGRS grid reference to 1 m (10 digits) for a UTM easting and northing.
+
+    Northern hemisphere.  The 100 km square letters follow the standard MGRS
+    lettering: column letters run A-H, J-R or S-Z depending on the zone (zone
+    42 uses S-Z), row letters cycle A-V without I or O, shifted by five in even
+    zones.  The latitude band letter is estimated from the northing, which is
+    exact away from band edges (everything here is near 34 deg N, mid-band S).
+    The easting and northing are truncated, never rounded, as the MGRS
+    convention requires: the reference names the 1 m square that contains
+    the point and denotes that square's south-west corner.
+    Check: the defaults reproduce JCAT slide 15's references.
+    """
+    e, n = int(math.floor(e + 1e-6)), int(math.floor(n + 1e-6))   # truncate; 1e-6 m absorbs floating-point error
+    col = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+    row = "ABCDEFGHJKLMNPQRSTUV"
+    c = col[((zone - 1) % 3) * 8 + e // 100000 - 1]
+    r = row[(n // 100000 + (5 if zone % 2 == 0 else 0)) % 20]
+    band = "CDEFGHJKLMNPQRSTUVWX"[int((n / 110900.0 + 80.0) // 8)]
+    return f"{zone}{band} {c}{r} {e % 100000:05d} {n % 100000:05d}"
+
+
+def location_lines(a):
+    """The helicopter and firing point lines for the top of the report, as (helicopter, firing point)."""
+    helo_src = ("JCAT slide 15: probable location at hit" if a.helo_is_jcat
+                else "as entered (not JCAT's reference)")
+    gun_src = ("JCAT slide 15: point of origin" if a.gun_is_jcat
+               else "as entered (not JCAT's reference)")
+    gun_kind = {2030.0: " (turret)", 2022.0: " (ground)"}.get(a.gun_alt, "")
+    return ([f"Helicopter    MGRS {mgrs(a.helo_e, a.helo_n)}, {a.helo_alt:.0f} m AMSL (wheel level)",
+             f"              {helo_src}"],
+            [f"Firing point  MGRS {mgrs(a.gun_e, a.gun_n)}, {a.gun_alt:.0f} m AMSL{gun_kind}",
+             f"              {gun_src}"])
+
+
+def get_args(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    a = p.add_argument
+    # Helicopter: JCAT probable location at hit, MGRS 42S VC 80153 64722 = UTM 480153 E, 3764722 N
+    a("--helo-e",   type=float, default=480153.0, help="helicopter centre easting, m")
+    a("--helo-n",   type=float, default=3764722.0, help="helicopter centre northing, m")
+    a("--helo-alt", type=float, default=2053.0, help="helicopter reference-point altitude, m AMSL, taken at wheel level (terrain 2015 m)")
+    a("--heading",  type=float, default=139.80, help="heading, deg GRID: JCAT ~137 deg magnetic (slide 6) + 2.68 deg E declination (NOAA, DGRF2010, 6 Aug 2011) = 139.68 true, + 0.12 grid convergence (TC 3-25.26 para 6-14)")
+    a("--speed-kt", type=float, default=50.0, help="AIRSPEED, knots (JCAT slide 6: ~50 kt, decelerating)")
+    a("--descent",  type=float, default=4.8,
+      help="rate of descent, m/s (positive down): a central value for the 64.3 m drop AMSL from the final BFT point (326 ft AGL over 2,018 m terrain, JCAT slide 15) to the hit (125 ft AGL over 2,015 m) over 351 m; a constant rate at 53.5 kt, the mean of 57 kt and 50 kt (slides 15, 6), gives 5.04, a constant glide angle taken at the hit (50 kt) gives 4.71")
+    a("--wind-kt",  type=float, default=0.0, help="wind speed, knots (0 = calm; see --wind-from-deg)")
+    a("--wind-from-deg", type=float, default=100.0,
+      help="direction the wind blows FROM, deg true (JCAT recorded 100 deg at 5 kt, measured later and elsewhere)")
+    # Rotor
+    a("--hub-sep-in", type=float, default=38 * 12 + 11, help="rotor hub separation, inches (TM 1-1520-240-10, fig. 2-1-1, principal dimensions)")
+    a("--aft-hub-up", type=float, default=(18 * 12 + 7.8) * IN, help="aft hub height above the reference point, m: 18 ft 7.8 in = 5.68452 m (reference point at wheel level, i.e. hub height above the ground as if landed; TM 1-1520-240-10, fig. 2-1-1)")
+    a("--rpm",        type=float, default=225.0, help="rotor speed, rev/min (Schomer et al., USA-CERL TR N-88/04, 1988, pp. 28 ff.; matches JCAT's ~3.75 Hz once-per-revolution oscillation, slides 12 and 38: 3.75 x 60 = 225)")
+    a("--radius-ft",  type=float, default=30.0, help="rotor radius hub-to-tip, ft (60 ft diameter; TM 1-1520-240-10, fig. 2-1-1)")
+    a("--strike-from-tip-in", type=float, default=122.0, help="strike station from tip, inches (JCAT slide 28)")
+    # Firing point: MGRS 42S VC 80167 64530
+    a("--gun-e",   type=float, default=480167.0, help="firing point easting, m")
+    a("--gun-n",   type=float, default=3764530.0, help="firing point northing, m")
+    a("--gun-alt", type=float, default=2030.0, help="firing point altitude, m AMSL (turret 2030, ground 2022)")
+    a("--gun-alt-tol", type=float, default=3.0, help="firing point altitude tolerance, m")
+    # Round
+    a("--round", choices=list(ROUNDS), default="OG-7V", help="round preset: launch speed, grenade mass and calibre")
+    a("--v0",        type=float, default=None, help="override launch speed, m/s")
+    a("--proj-mass", type=float, default=None, help="override grenade mass in flight, kg")
+    a("--proj-dia",  type=float, default=None, help="override grenade calibre, m")
+    # Air
+    a("--pressure-alt-ft", type=float, default=6605.0, help="pressure altitude, ft (JCAT slide 6)")
+    a("--oat-c",           type=float, default=22.0, help="outside air temperature, deg C (JCAT slide 6)")
+    a("--air-density",     type=float, default=None, help="override air density, kg/m^3")
+    # JCAT observed angles (slides 27-28)
+    a("--planform-angle", type=float, default=15.0, help="angle of strike path to leading edge in planform view, deg")
+    a("--section-angle",  type=float, default=40.0, help="angle of strike path to bottom surface in chord cross-section, deg")
+    a("--angle-tol", type=float, default=2.5, help="tolerance on the two JCAT angles, deg: the author's assessment, not a JCAT figure (JCAT gives the angles as approximate, with no tolerance; 2.5 is the rounding to the nearest 5 deg, 5 the wider case allowing for measurement error; see Sources for the defaults)")
+    # Drag
+    a("--vacuum", action="store_true", help="print the vacuum (drag-free) case in full instead of Cd 0.575 (vacuum is also in the drag bracket, and ex17_vacuum_check.py prints every step)")
+    a("--drag", action="store_true", help="the default since v4.8 (drag at Cd = mean of cd-min, cd-max, printed in full); kept so older commands still run")
+    a("--cd-min", type=float, default=0.45, help="drag coefficient lower bound (BRL MR 1594)")
+    a("--cd-max", type=float, default=0.70, help="drag coefficient upper bound (BRL-TR-2882)")
+    # Monte Carlo
+    a("--mc", type=int, default=0, help="number of Monte Carlo samples (0 = off)")
+    a("--helo-alt-tol", type=float, default=8.0, help="helicopter altitude tolerance, m")
+    a("--v0-tol", type=float, default=0.0, help="launch speed tolerance, m/s")
+    a("--airspeed-tol-kt", type=float, default=0.0, help="airspeed tolerance, knots")
+    a("--wind-tol-kt", type=float, default=0.0, help="wind speed tolerance, knots (direction fixed)")
+    a("--attitude-tol", type=float, default=0.0, help="disc pitch/roll range, deg (0 = level disc, not tested).  JCAT records the attitude as unknown, so any value is illustrative, not a source tolerance.  Used by the Monte Carlo and, when set, by a SENSITIVITY check and the WHAT MOVES THE ANSWER summary (2.5 matches the validation document's tables)")
+    a("--seed", type=int, default=1, help="random seed for reproducibility")
+    # Geometry options
+    a("--pitch-att", type=float, default=0.0, help="disc/body pitch attitude, deg nose-up")
+    a("--roll",      type=float, default=0.0, help="disc/body roll, deg right-wing-down")
+    a("--rotor-dir", choices=["cw", "ccw"], default="cw", help="aft rotor rotation viewed from above")
+    a("--rotor",     choices=["aft", "fwd"], default="aft", help="which rotor was struck")
+    a("--fwd-hub-up", type=float, default=5.0, help="forward hub height above the reference point, m, used with --rotor fwd (reference point at wheel level, i.e. hub height above the ground as if landed; TM 1-1520-240-10, fig. 2-1-1)")
+    a("--angle-reading", choices=["projected", "true3d"], default="projected", help="which angle definition to match")
+    a("--grid-to-true-deg", type=float, default=-0.12, help="add to a grid azimuth to get true here (grid convergence)")
+    args = p.parse_args(argv)
+    args.helo_is_jcat = (args.helo_e, args.helo_n) == (p.get_default("helo_e"), p.get_default("helo_n"))
+    args.gun_is_jcat = (args.gun_e, args.gun_n) == (p.get_default("gun_e"), p.get_default("gun_n"))
+    args.angles_are_jcat = (args.planform_angle, args.section_angle) == (p.get_default("planform_angle"), p.get_default("section_angle"))
+    r = ROUNDS[args.round]
+    args.projectile = r["projectile"]
+    args.v0 = r["v0"] if args.v0 is None else args.v0
+    args.proj_mass = r["mass"] if args.proj_mass is None else args.proj_mass
+    args.proj_dia = r["dia"] if args.proj_dia is None else args.proj_dia
+    args.air_density_source = "given"
+    if args.air_density is None:
+        args.air_density = isa_density(args.pressure_alt_ft, args.oat_c)
+        args.air_density_source = f"PA {args.pressure_alt_ft:.0f} ft, {args.oat_c:.0f} C"
+    return args
+
+
+# ----------------------------------------------------------------------------
+# 2. Frames and kinematics
+# ----------------------------------------------------------------------------
+def rotate(v, axis, angle_deg):
+    """Rotate v by angle_deg about the unit axis k, where k is perpendicular to v.
+
+    With k.v = 0 the rotation stays in the plane spanned by v and k x v, so
+    v' = v cos a + (k x v) sin a, right-hand sense about k (plane rotation;
+    Riley, Hobson & Bence, Mathematical Methods for Physics and Engineering,
+    3rd ed., vector algebra).  Every call here meets the condition: pitch turns
+    forward and up about starboard, roll turns starboard and up about forward.
+    """
+    assert abs(axis @ v) < 1e-9, "rotate() needs an axis perpendicular to the vector"
+    a = math.radians(angle_deg)
+    return v * math.cos(a) + np.cross(axis, v) * math.sin(a)
+
+
+def body_axes(heading_deg, pitch_att_deg=0.0, roll_deg=0.0):
+    """Forward / starboard / up unit vectors in ENU.
+
+    Heading h clockwise from grid north: forward = (sin h, cos h, 0); starboard is
+    forward rotated 90 deg clockwise.  Optional nose-up pitch (about starboard)
+    then right-wing-down roll (about forward), yaw-pitch-roll order.
+    Senses, with rotate()'s right-hand rule in ENU: starboard x forward = up,
+    so a positive turn about starboard lifts the nose; forward x starboard =
+    down, so a positive turn about forward drops the starboard side.  Both
+    are checked below, so the sign cannot slip again (v4.8 and earlier
+    turned the nose DOWN for a positive --pitch-att).
+    """
+    h = math.radians(heading_deg)
+    fwd = np.array([math.sin(h), math.cos(h), 0.0])
+    stbd = np.array([math.cos(h), -math.sin(h), 0.0])
+    up = np.array([0.0, 0.0, 1.0])
+    if pitch_att_deg:
+        fwd, up = rotate(fwd, stbd, pitch_att_deg), rotate(up, stbd, pitch_att_deg)
+        assert (fwd[2] > 0) == (pitch_att_deg > 0), "positive --pitch-att must raise the nose"
+    if roll_deg:
+        stbd, up = rotate(stbd, fwd, roll_deg), rotate(up, fwd, roll_deg)
+        assert (stbd[2] < 0) == (roll_deg > 0), "positive --roll must lower the starboard side"
+    return fwd, stbd, up
+
+
+def wind_vector(wind_kt, wind_from_deg):
+    """Velocity of the air (ENU, m/s).  Meteorological convention: the wind blows FROM wind_from_deg."""
+    w = math.radians(wind_from_deg)
+    return -wind_kt * KT * np.array([math.sin(w), math.cos(w), 0.0])
+
+
+def blade_axes(az, pitch, fwd, stbd, up, rotor_dir):
+    """Return (radial_out, motion, span, chord, normal) unit vectors; az and pitch in degrees.
+
+    Works on scalars or broadcastable arrays (the result gains a trailing
+    axis of length 3).  For rotation sign s (+1 clockwise from above) the
+    direction of motion at azimuth theta is s (cos th stbd - sin th fwd).
+    The leading edge faces the motion, so chord (LE -> TE) = -motion; pitch
+    rotates chord and normal about the span axis (a 2-D rotation matrix).
+    """
+    th = np.radians(np.asarray(az, float))[..., None]
+    b = np.radians(np.asarray(pitch, float))[..., None]
+    radial = np.sin(th) * stbd + np.cos(th) * fwd
+    motion = rotor_dir * (np.cos(th) * stbd - np.sin(th) * fwd)
+    chord0 = -motion
+    chord = np.cos(b) * chord0 - np.sin(b) * up
+    normal = np.sin(b) * chord0 + np.cos(b) * up
+    return radial, motion, -radial, chord, normal
+
+
+def build_cfg(a, gun_alt=None, helo_alt=None, pitch_att=None, roll=None, cd=0.0,
+              airspeed_kt=None, wind_kt=None, v0=None):
+    """Everything the geometry and trajectory need, for one set of inputs."""
+    gun_alt = a.gun_alt if gun_alt is None else gun_alt
+    helo_alt = a.helo_alt if helo_alt is None else helo_alt
+    pa = a.pitch_att if pitch_att is None else pitch_att
+    ro = a.roll if roll is None else roll
+    airspeed_kt = a.speed_kt if airspeed_kt is None else airspeed_kt
+    wind_kt = a.wind_kt if wind_kt is None else wind_kt
+    fwd, stbd, up = body_axes(a.heading, pa, ro)
+    h = math.radians(a.heading)
+    level_fwd = np.array([math.sin(h), math.cos(h), 0.0])
+    wind = wind_vector(wind_kt, a.wind_from_deg)
+    # Ground velocity = air velocity (airspeed along the heading) + wind; descent added separately
+    v_helo = airspeed_kt * KT * level_fwd + wind + np.array([0.0, 0.0, -a.descent])
+    sense = 1.0 if a.rotor_dir == "cw" else -1.0
+    if a.rotor == "aft":
+        hub = -0.5 * a.hub_sep_in * IN * fwd + a.aft_hub_up * up + np.array([0.0, 0.0, helo_alt])
+        rotor_dir = sense
+    else:
+        hub = 0.5 * a.hub_sep_in * IN * fwd + a.fwd_hub_up * up + np.array([0.0, 0.0, helo_alt])
+        rotor_dir = -sense                                   # tandem rotors turn in opposite senses
+    return dict(axes=(fwd, stbd, up), v_helo=v_helo, wind=wind, hub=hub, helo_alt=helo_alt,
+                omega=2.0 * math.pi * a.rpm / 60.0,          # omega = 2 pi N / 60
+                r=(a.radius_ft * 12.0 - a.strike_from_tip_in) * IN,
+                gun=np.array([a.gun_e - a.helo_e, a.gun_n - a.helo_n, gun_alt]),
+                v0=a.v0 if v0 is None else v0, cd=cd, mass=a.proj_mass, dia=a.proj_dia,
+                rho=a.air_density, reading=a.angle_reading, rotor_dir=rotor_dir)
+
+
+def strike_target(cfg, az):
+    return cfg["hub"] + cfg["r"] * blade_axes(az, 0.0, *cfg["axes"], cfg["rotor_dir"])[0]
+
+
+# ----------------------------------------------------------------------------
+# 3. Projectile
+# ----------------------------------------------------------------------------
+def vacuum_arrival(gun, target, v0):
+    """Drag-free arrival, closed form.
+
+    Trajectory y = x tan a - g x^2 / (2 v0^2 cos^2 a) (McCoy, Modern Exterior
+    Ballistics, ch. 3); with 1/cos^2 = 1 + tan^2 this is a quadratic
+    in tan a, low root = direct fire.  Flight time t = x / (v0 cos a),
+    vertical velocity v0 sin a - g t.  Wind has no effect without drag.
+    """
+    d = target - gun
+    dh = math.hypot(d[0], d[1])
+    k = G * dh ** 2 / (2.0 * v0 ** 2)
+    disc = dh ** 2 - 4.0 * k * (k + d[2])
+    if disc < 0:
+        return None
+    a = math.atan((dh - math.sqrt(disc)) / (2.0 * k))
+    t = dh / (v0 * math.cos(a))
+    u = d[:2] / dh
+    vp = np.array([v0 * math.cos(a) * u[0], v0 * math.cos(a) * u[1], v0 * math.sin(a) - G * t])
+    return dict(vp=vp, el=math.degrees(a), t=t, aim=math.degrees(math.atan2(u[0], u[1])) % 360.0)
+
+
+def fly(gun, target, v0, cd, mass, dia, rho, wind, dt=2e-3, tol=1e-7):
+    """Point-mass trajectories with quadratic drag relative to the air, one row per sample.
+
+    m dv/dt = -1/2 rho Cd A |v - w| (v - w) + m g   (McCoy, Modern Exterior
+    Ballistics, ch. 5), integrated with classical fourth-order Runge-Kutta
+    (Riley, Hobson & Bence, 3rd ed., ch. 27, p. 1026).
+    Hitting the target is a two-point boundary-value problem solved by
+    shooting: guess the launch elevation, march the trajectory out to the
+    target's range, and iterate on the starting value until the height there
+    matches (Riley, Hobson & Bence, 3rd ed., p. 1030).
+    The launch elevation is found by the secant method (RHB's "linear
+    interpolation", p. 988) on the height error at
+    the target's horizontal range, and the launch azimuth is aimed off for
+    wind drift by removing the lateral miss.  Returns arrival velocity (n,3),
+    launch elevation (deg), flight time (s) and launch azimuth (deg, grid);
+    rows that cannot reach the target are NaN.
+    """
+    gun = np.atleast_2d(gun); target = np.atleast_2d(target)
+    n = len(target)
+    d = target - gun
+    dh = np.hypot(d[:, 0], d[:, 1])
+    u = d[:, :2] / dh[:, None]
+    rgt = np.column_stack([u[:, 1], -u[:, 0]])
+    v0 = np.broadcast_to(np.asarray(v0, float), (n,))
+    k = np.broadcast_to(0.5 * rho * np.asarray(cd, float) * math.pi * (dia / 2) ** 2 / mass, (n,))
+    w = np.broadcast_to(np.asarray(wind, float), (n, 3))
+
+    def acc(v):
+        rel = v - w
+        s = np.linalg.norm(rel, axis=1)
+        out = -k[:, None] * s[:, None] * rel
+        out[:, 2] -= G
+        return out
+
+    def shoot(el, dpsi):
+        hdir = np.cos(dpsi)[:, None] * u + np.sin(dpsi)[:, None] * rgt
+        vel = np.zeros((n, 3)); pos = np.zeros((n, 3))
+        vel[:, :2] = (v0 * np.cos(el))[:, None] * hdir
+        vel[:, 2] = v0 * np.sin(el)
+        z_at = np.full(n, np.nan); y_at = np.full(n, np.nan); t_at = np.full(n, np.nan)
+        v_at = np.full((n, 3), np.nan)
+        done = np.zeros(n, bool); t = 0.0
+        while not done.all() and t < 10.0:
+            k1 = acc(vel); v2 = vel + 0.5 * dt * k1
+            k2 = acc(v2);  v3 = vel + 0.5 * dt * k2
+            k3 = acc(v3);  v4 = vel + dt * k3
+            k4 = acc(v4)
+            vel_n = vel + dt / 6.0 * (k1 + 2 * k2 + 2 * k3 + k4)
+            pos_n = pos + dt / 6.0 * (vel + 2 * v2 + 2 * v3 + v4)
+            p_old = pos[:, 0] * u[:, 0] + pos[:, 1] * u[:, 1]
+            p_new = pos_n[:, 0] * u[:, 0] + pos_n[:, 1] * u[:, 1]
+            hit = (~done) & (p_new >= dh)
+            if hit.any():
+                f = (dh[hit] - p_old[hit]) / (p_new[hit] - p_old[hit])      # linear interpolation within a step
+                P0, P1 = pos[hit], pos_n[hit]
+                z_at[hit] = P0[:, 2] + f * (P1[:, 2] - P0[:, 2])
+                y_at[hit] = (P0[:, 0] + f * (P1[:, 0] - P0[:, 0])) * rgt[hit, 0] + (P0[:, 1] + f * (P1[:, 1] - P0[:, 1])) * rgt[hit, 1]
+                v_at[hit] = vel[hit] + f[:, None] * (vel_n[hit] - vel[hit])
+                t_at[hit] = t + f * dt
+                done |= hit
+            pos, vel = pos_n, vel_n; t += dt
+        return z_at - d[:, 2], y_at, v_at, t_at
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        dpsi = np.zeros(n)
+        el0 = np.arctan2(d[:, 2], dh) + math.radians(2.0)
+        el1 = el0 + math.radians(1.5)
+        f0, y0, _, _ = shoot(el0, dpsi)
+        dpsi = dpsi - np.nan_to_num(y0) / dh
+        f1, y1, v, t = shoot(el1, dpsi)
+        for _ in range(30):
+            dpsi = dpsi - np.nan_to_num(y1) / dh
+            den = f1 - f0
+            el2 = np.where(np.abs(den) > 1e-14, el1 - f1 * (el1 - el0) / den, el1)
+            el0, f0, el1 = el1, f1, el2
+            f1, y1, v, t = shoot(el1, dpsi)
+            if np.nanmax(np.abs(f1), initial=0) < tol and np.nanmax(np.abs(y1), initial=0) < tol:
+                break
+    aim = (np.degrees(np.arctan2(u[:, 0], u[:, 1]) + dpsi)) % 360.0
+    bad = ~np.isfinite(f1) | (np.abs(f1) > 1e-3)
+    v[bad] = np.nan
+    return v, np.degrees(el1), t, aim
+
+
+def arrival(cfg, target):
+    """Arrival of the round at `target` for this configuration (vacuum closed form when Cd = 0)."""
+    if cfg["cd"] == 0.0:
+        return vacuum_arrival(cfg["gun"], target, cfg["v0"])
+    v, el, t, aim = fly(cfg["gun"], target, cfg["v0"], cfg["cd"], cfg["mass"], cfg["dia"], cfg["rho"], cfg["wind"])
+    if not np.isfinite(v[0]).all():
+        return None
+    return dict(vp=v[0], el=float(el[0]), t=float(t[0]), aim=float(aim[0]))
+
+
+# ----------------------------------------------------------------------------
+# 4. Strike geometry and the blade solver
+# ----------------------------------------------------------------------------
+def angle_fields(az, pitch, vp, cfg):
+    """The two JCAT-style angles for blade azimuth(s) az and pitch(es), degrees.
+
+    Relative velocity v_rel = v_projectile - v_blade (Galilean addition), with
+    v_blade = v_helicopter + omega r (direction of motion) (rigid rotation).
+    Projected reading (default): planform = atan2(v_chord, v_span), the path
+    against the leading edge seen on the blade's plan; section =
+    atan2(v_normal, v_chord), the path against the bottom surface seen in
+    cross-section.  JCAT slide 28 draws the angles this way.  true3d reading:
+    angle to the leading edge acos(v_span/|v|) and to the chord plane
+    asin(v_normal/|v|).
+    """
+    fwd, stbd, up = cfg["axes"]
+    radial, motion, span, chord, normal = blade_axes(az, pitch, fwd, stbd, up, cfg["rotor_dir"])
+    vrel = vp - (cfg["v_helo"] + cfg["omega"] * cfg["r"] * motion)
+    vs = (vrel * span).sum(-1); vc = (vrel * chord).sum(-1); vn = (vrel * normal).sum(-1)
+    if cfg["reading"] == "projected":
+        a1, a2 = np.degrees(np.arctan2(vc, vs)), np.degrees(np.arctan2(vn, vc))
+    else:
+        nv = np.linalg.norm(vrel, axis=-1)
+        a1, a2 = np.degrees(np.arccos(np.clip(vs / nv, -1, 1))), np.degrees(np.arcsin(np.clip(vn / nv, -1, 1)))
+    a1, a2 = np.broadcast_arrays(a1, a2)          # the span component depends on azimuth only
+    return a1, a2, (vs, vc, vn, vrel)
+
+
+def _wrap(x):
+    return (x + 180.0) % 360.0 - 180.0
+
+
+K_EXACT = 12       # exact trajectories per case, 30 deg apart round the rotor circle
+H_FIT = 4          # Fourier harmonics fitted through them (fit error ~2e-6 deg, the integrator's own noise)
+GRID = 0.05        # deg: the fit is scanned for solutions at this azimuth step
+POLISH_TOL = 1e-8  # deg: exact polish stops when a step moves the azimuth less than this
+
+
+def _basis(az):
+    """Fourier basis 1, cos(h az), sin(h az) for h = 1..H_FIT, one row per azimuth (deg).
+
+    A truncated Fourier series in azimuth (Riley, Hobson & Bence, 3rd ed.,
+    ch. 12, pp. 415-432).  Used only to locate solutions: see find_roots.
+    """
+    th = np.radians(np.atleast_1d(np.asarray(az, float)))[:, None]
+    cols = [np.ones_like(th)]
+    for h in range(1, H_FIT + 1):
+        cols += [np.cos(h * th), np.sin(h * th)]
+    return np.hstack(cols)
+
+
+def _arrivals(cfgs, idx, az):
+    """Exact arrival velocity (n, 3) at the strike point of blade azimuth az[k] in case cfgs[idx[k]].
+
+    Drag-free cases use the closed form; the rest are flown together in one
+    vectorised call.  Rows the round cannot reach are NaN.
+    """
+    idx = np.atleast_1d(np.asarray(idx)); az = np.atleast_1d(np.asarray(az, float))
+    tg = np.array([strike_target(cfgs[i], z) for i, z in zip(idx, az)]).reshape(-1, 3)
+    out = np.full((len(idx), 3), np.nan)
+    vac = np.array([cfgs[i]["cd"] == 0.0 for i in idx], bool)
+    for k in np.where(vac)[0]:
+        r = vacuum_arrival(cfgs[idx[k]]["gun"], tg[k], cfgs[idx[k]]["v0"])
+        if r is not None:
+            out[k] = r["vp"]
+    dr = np.where(~vac)[0]
+    if len(dr):
+        c0 = cfgs[idx[dr[0]]]                  # mass, calibre and air density are the same in every case
+        v, _, _, _ = fly(np.array([cfgs[i]["gun"] for i in idx[dr]]), tg[dr],
+                         np.array([cfgs[i]["v0"] for i in idx[dr]]), np.array([cfgs[i]["cd"] for i in idx[dr]]),
+                         c0["mass"], c0["dia"], c0["rho"], np.array([cfgs[i]["wind"] for i in idx[dr]]))
+        out[dr] = v
+    return out
+
+
+def _residual(cfg, az, vp, P, S):
+    """Planform error (deg) at blade azimuth(s) az, with the blade pitch in closed form.
+
+    Feathering by pitch b turns the chord and normal about the span, a rotation
+    in a plane, so the relative velocity's chord and normal components are its
+    components (A, B) along the unpitched chord and the disc normal turned
+    through b:  v_chord = rho cos(phi + b),  v_normal = rho sin(phi + b), with
+    rho = sqrt(A^2 + B^2) and phi = atan2(B, A).
+    Projected reading: the section angle atan2(v_normal, v_chord) is phi + b,
+    so the pitch that gives section angle S is b = S - phi, and then
+    v_chord = rho cos S: the planform error depends on azimuth alone.
+    True-3-D reading: the angle to the leading edge, acos(v_span / |v|), does
+    not depend on pitch, and asin(v_normal / |v|) = S has two pitch branches.
+    Returns the error (n,) and the pitch (n, 2); the second column is used by
+    the true-3-D reading only.
+    """
+    az = np.atleast_1d(np.asarray(az, float))
+    _, motion, span, chord0, normal0 = blade_axes(az, 0.0, *cfg["axes"], cfg["rotor_dir"])
+    vrel = vp - (cfg["v_helo"] + cfg["omega"] * cfg["r"] * motion)
+    A = (vrel * chord0).sum(-1); B = (vrel * normal0).sum(-1); vs = (vrel * span).sum(-1)
+    phi = np.degrees(np.arctan2(B, A)); rho = np.hypot(A, B)
+    pitch = np.full((len(az), 2), np.nan)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        if cfg["reading"] == "projected":
+            err = _wrap(np.degrees(np.arctan2(rho * math.cos(math.radians(S)), vs)) - P)
+            pitch[:, 0] = _wrap(S - phi)
+        else:
+            nv = np.linalg.norm(vrel, axis=-1)
+            err = np.degrees(np.arccos(np.clip(vs / nv, -1.0, 1.0))) - P
+            s = nv * math.sin(math.radians(S)) / rho
+            asn = np.degrees(np.arcsin(np.clip(s, -1.0, 1.0)))
+            fits = np.abs(s) <= 1.0
+            pitch[:, 0] = np.where(fits, _wrap(asn - phi), np.nan)
+            pitch[:, 1] = np.where(fits, _wrap(180.0 - asn - phi), np.nan)
+    return err, pitch
+
+
+def find_roots(cfgs, P, S, top_only=False):
+    """Every blade orientation that reproduces the two angles, for one case or many.
+
+    No starting guess.  For each case:
+    1. Fly K_EXACT exact trajectories to strike points 30 deg apart round the
+       rotor circle and fit a Fourier series in azimuth (RHB ch. 12,
+       pp. 415-432) by least squares (RHB p. 1271) through the arrival
+       velocities.  The arrival changes smoothly as the strike point moves round
+       the 6 m circle, and the fit matches exact trajectories to about 2e-6 deg.
+    2. Scan the fit every GRID deg for sign changes of the planform error, and
+       look closer wherever the error turns back close to zero, because two
+       solutions about to merge can sit between grid points.
+    3. Polish each solution with exact trajectories: secant steps inside the
+       bracket, halving it when a step would leave it (RHB sec. 27.1: linear
+       interpolation, p. 988, and binary chopping).
+    The fit only tells the solver where to look; every reported value comes from exact
+    trajectories.  Pitches of 90 deg or more are dropped.  top_only keeps just
+    the highest-pitch solution (the Monte Carlo).  Returns a list per case of
+    (azimuth, pitch), highest pitch first, and the number of located solutions
+    that exact trajectories could not confirm.
+    """
+    n = len(cfgs)
+    P = np.broadcast_to(np.asarray(P, float), (n,)); S = np.broadcast_to(np.asarray(S, float), (n,))
+    azK = np.arange(K_EXACT) * 360.0 / K_EXACT
+    vK = _arrivals(cfgs, np.repeat(np.arange(n), K_EXACT), np.tile(azK, n)).reshape(n, K_EXACT, 3)
+    grid = np.arange(0.0, 360.0, GRID); BK, BG = _basis(azK), _basis(grid)
+    cand = []                                                     # (case, located root, bracket half-width)
+    for i in range(n):
+        cf, Pi, Si = cfgs[i], P[i], S[i]
+        if np.isfinite(vK[i]).all():
+            coef = np.linalg.lstsq(BK, vK[i], rcond=None)[0]     # least squares, 12 points, 9 coefficients (RHB p. 1271)
+            model = lambda z, coef=coef: _basis(z) @ coef
+            vg = BG @ coef
+        else:                   # part of the circle is out of reach: exact arrivals every 0.5 deg instead of the fit
+            a5 = np.arange(0.0, 360.0, 0.5); v5 = _arrivals(cfgs, np.full(len(a5), i), a5)
+            model = lambda z, a5=a5, v5=v5: np.column_stack(
+                [np.interp(np.atleast_1d(z), a5, v5[:, j], period=360.0) for j in range(3)])
+            vg = model(grid)
+        err, _ = _residual(cf, grid, vg, Pi, Si)
+        e2 = np.append(err, err[0]); a2 = np.append(grid, 360.0)
+        good = np.isfinite(e2) & (np.abs(e2) < 90.0)
+        brackets = [(a2[k], a2[k + 1]) for k in
+                    np.where(good[:-1] & good[1:] & (np.sign(e2[:-1]) != np.sign(e2[1:])))[0]]
+        m = len(err)
+        for k in np.where(good[:m] & (np.abs(err) < 0.2))[0]:   # error turns back near zero: look closer
+            b4, af = err[k - 1], err[(k + 1) % m]
+            if (err[k] - b4) * (af - err[k]) < 0 and np.sign(b4) == np.sign(err[k]) == np.sign(af):
+                fine = np.linspace(grid[k] - GRID, grid[k] + GRID, 201)
+                ef, _ = _residual(cf, fine, model(fine), Pi, Si)
+                brackets += [(fine[j], fine[j + 1]) for j in np.where(np.sign(ef[:-1]) != np.sign(ef[1:]))[0]]
+        located = []
+        for lo, hi in brackets:
+            ev, pv = _residual(cf, [lo, hi], model(np.array([lo, hi])), Pi, Si)
+            f = ev[0] / (ev[0] - ev[1])
+            p = pv[0] + f * (pv[1] - pv[0])
+            p = p[np.abs(p) < 91.0]
+            if len(p):
+                located.append(((lo + f * (hi - lo)) % 360.0, p.max()))
+        located.sort()
+        if top_only and located:
+            best = max(p for _, p in located)
+            keep = [x for x in located if x[1] >= best - 1.0]
+        else:
+            keep = located
+        for r, _ in keep:
+            gaps = [abs(_wrap(r - q)) for q, _ in located if abs(_wrap(r - q)) > 0.0]
+            w = min([0.01] + [0.45 * g for g in gaps])
+            cand.append((i, r, w))
+
+    out = [[] for _ in range(n)]
+    if not cand:
+        return out, 0
+    ci = np.array([c[0] for c in cand]); r = np.array([c[1] for c in cand]); w = np.array([c[2] for c in cand])
+
+    def exact(k, z):                                               # error and pitch from exact trajectories
+        vp = _arrivals(cfgs, ci[k], z)
+        e = np.full(len(k), np.nan); p = np.full((len(k), 2), np.nan)
+        for j, kk in enumerate(k):
+            ee, pp = _residual(cfgs[ci[kk]], z[j:j + 1], vp[j:j + 1], P[ci[kk]], S[ci[kk]])
+            e[j], p[j] = ee[0], pp[0]
+        return e, p
+
+    allk = np.arange(len(cand))
+    lo, hi = r - w, r + w
+    flo, _ = exact(allk, lo); fhi, _ = exact(allk, hi)
+    bracketed = np.isfinite(flo) & np.isfinite(fhi) & (np.sign(flo) != np.sign(fhi))
+    x0, f0, x1, f1 = lo.copy(), flo.copy(), hi.copy(), fhi.copy()
+    root = np.full(len(cand), np.nan); pitch = np.full((len(cand), 2), np.nan)
+    active = bracketed.copy()
+    for _ in range(40):
+        k = np.where(active)[0]
+        if not len(k):
+            break
+        with np.errstate(invalid="ignore", divide="ignore"):
+            x = x1[k] - f1[k] * (x1[k] - x0[k]) / (f1[k] - f0[k])      # secant step
+        x = np.where(np.isfinite(x) & (lo[k] < x) & (x < hi[k]), x, 0.5 * (lo[k] + hi[k]))   # else halve
+        fx, px = exact(k, x)
+        same = np.sign(fx) == np.sign(flo[k])
+        lo[k] = np.where(same, x, lo[k]); flo[k] = np.where(same, fx, flo[k])
+        hi[k] = np.where(same, hi[k], x); fhi[k] = np.where(same, fhi[k], fx)
+        step = np.abs(x - x1[k])
+        x0[k], f0[k] = x1[k], f1[k]
+        x1[k], f1[k] = x, fx
+        root[k], pitch[k] = x, px
+        active[k[(step < POLISH_TOL) | (fx == 0.0) | (hi[k] - lo[k] < POLISH_TOL)]] = False
+    for kk in np.where(bracketed)[0]:
+        for p in pitch[kk]:
+            if np.isfinite(p) and abs(p) < 90.0:
+                az = root[kk] % 360.0
+                if not any(abs(_wrap(az - q)) < 1e-6 and abs(p - pp) < 1e-6 for q, pp in out[ci[kk]]):
+                    out[ci[kk]].append((az, p))
+    for i in range(n):
+        out[i].sort(key=lambda x: -x[1])
+        if top_only:
+            out[i] = out[i][:1]
+    return out, int((~bracketed).sum())
+
+
+def solve_strike(cfg, P, S):
+    """Blade azimuth and pitch for one case: the highest-pitch solution, with every solution in 'roots'."""
+    roots, unresolved = find_roots([cfg], P, S)
+    roots = roots[0]
+    if not roots:
+        return None
+    az, pitch = roots[0]
+    arr = arrival(cfg, strike_target(cfg, az))
+    if arr is None:
+        return None
+    return dict(az=az, pitch=pitch, roots=roots, unresolved=unresolved, target=strike_target(cfg, az), **arr)
+
+
+# ----------------------------------------------------------------------------
+# 5. Report
+# ----------------------------------------------------------------------------
+def direction(p):
+    """Grid bearing (deg) and elevation (deg) of vector p, elevation on horizontal range."""
+    return (math.degrees(math.atan2(p[0], p[1])) % 360.0,
+            math.degrees(math.atan2(p[2], math.hypot(p[0], p[1]))))
+
+
+def report(a):
+    P, S = a.planform_angle, a.section_angle
+    cd_mid = 0.5 * (a.cd_min + a.cd_max)
+    cfg = build_cfg(a, cd=0.0 if a.vacuum else cd_mid)
+    case = "vacuum, drag-free" if a.vacuum else f"drag, Cd {cd_mid:.3f}"     # the case printed in full
+    gv = cfg["v_helo"][:2]
+    track = math.degrees(math.atan2(gv[0], gv[1])) % 360.0
+    g2t = a.grid_to_true_deg
+    print("Extortion 17 aft-rotor blade-strike geometry, v4.13\n" + "=" * 52)
+    print("INPUTS")
+    print("For the following known values:")
+    helo, gun = location_lines(a)
+    print("\n".join(helo))
+    ind = "              "                                                    # indented under the helicopter
+    print(f"{ind}Airspeed {a.speed_kt:.1f} kt on {a.heading:.2f} grid ({(a.heading + g2t) % 360:.2f} T);")
+    print(f"{ind}wind {a.wind_kt:.1f} kt from {a.wind_from_deg:.0f} T;")
+    print(f"{ind}Descent {a.descent} m/s")
+    print(f"{ind}Ground speed {np.linalg.norm(gv) / KT:.1f} kt on track {track:.1f} grid"
+          f" ({(track + g2t) % 360:.1f} T) (crab {_wrap(track - a.heading):+.1f})")
+    print(f"{ind}Blade element speed round hub: {cfg['omega'] * cfg['r']:.1f} m/s @ r = {cfg['r']:.3f}m")
+    print("\n".join(gun))
+    print(f"{ind}Offset from helo centre (grid E, N): ({cfg['gun'][0]:.0f}, {cfg['gun'][1]:.0f}) m")
+    gb = math.degrees(math.atan2(cfg["gun"][0], cfg["gun"][1])) % 360.0      # where the round came FROM
+    rel = _wrap(gb - a.heading)
+    print(f"{ind}Azimuth {gb:.1f} grid ({(gb + a.grid_to_true_deg) % 360:.1f} true) from helo centre,")
+    print(f"{ind}= bearing {abs(rel):.1f} deg {'starboard' if rel >= 0 else 'port'} of the nose")
+    preset = ROUNDS[a.round]
+    entered = (a.v0, a.proj_mass, a.proj_dia) != (preset["v0"], preset["mass"], preset["dia"])
+    print(f"Round {a.round}: fires the {a.projectile} grenade, launch speed {a.v0:.0f} m/s,"
+          f" {a.proj_mass:.3f} kg, {a.proj_dia * 1000:.0f} mm" + (" (as entered)" if entered else ""))
+    print(f"Air density {a.air_density:.4f} kg/m^3 ({a.air_density_source})")
+    print(f"Printed in full: {case}")
+    if a.vacuum:
+        print(f"{ind}(drag cases in the DRAG BRACKET below)\n")
+    else:
+        print(f"{ind}(middle of the BRL bracket, {a.cd_min:.2f}-{a.cd_max:.2f};")
+        print(f"{ind} vacuum: DRAG BRACKET below, or ex17_vacuum_check.py)\n")
+    src = ("JCAT slide 28" if a.angles_are_jcat else "as entered")
+    if a.angle_reading == "projected":
+        print(f"Find the blade bearing and pitch at which the projectile strikes the blade at {P:g} deg"
+              f" to the leading edge (plan) and {S:g} deg to the lower surface (section) ({src}).\n")
+    else:
+        print(f"Find the blade bearing and pitch at which the projectile strikes the blade at {P:g} deg"
+              f" to the leading edge (3-D) and {S:g} deg to the blade's chord plane (3-D) ({src}).\n")
+
+    s = solve_strike(cfg, P, S)
+    if s is None:
+        print("No solution for these inputs.")
+        return
+    az, pitch = s["az"], s["pitch"]
+    F1, F2, (vs, vc, vn, vrel) = angle_fields(az, pitch, s["vp"], cfg)
+    v_b = cfg["v_helo"] + cfg["omega"] * cfg["r"] * blade_axes(az, pitch, *cfg["axes"], cfg["rotor_dir"])[1]
+    d = s["target"] - cfg["gun"]; dh = math.hypot(d[0], d[1])
+    los_el = math.degrees(math.atan2(d[2], dh))
+    print(f"SOLUTION, IN FULL: {case}")
+    print(f"Blade bearing: {az:.2f} deg starboard of the nose (clockwise)")
+    print(f"                       = {(az + 180) % 360:.2f} deg standard rotor azimuth ")
+    print("                        (from tail, with rotation)")
+    print(f"                       ; blade span line azimuth {(a.heading + az) % 360:.1f} grid")
+    print(f"                         ({(a.heading + az + g2t) % 360:.1f} true)")
+    print(f"Blade pitch (surface): {pitch:.2f} deg leading-edge-up at the strike station")
+    print(f"  Retreating blade     : {'yes' if (v_b @ cfg['axes'][0]) < 0 else 'no'}")
+    for r in s["roots"][1:]:
+        print(f"  Other solution       : bearing {r[0]:.2f} deg, pitch {r[1]:.2f} deg"
+              + ("  (physically implausible blade pitch)" if abs(r[1]) > 45 else ""))
+    if len(s["roots"]) > 1:
+        print("  (each solution is computed with its own strike point and trajectory)")
+    if s["unresolved"]:
+        print(f"  ({s['unresolved']} further candidate(s) near a fold could not be confirmed with exact trajectories)")
+    print(f"TRAJECTORY ({case})")
+    print(f"  Strike point (grid)   : E {a.helo_e + s['target'][0]:.1f}, N {a.helo_n + s['target'][1]:.1f}, {s['target'][2]:.1f} m AMSL")
+    print(f"                          MGRS {mgrs(a.helo_e + s['target'][0], a.helo_n + s['target'][1])} (1 m)")
+    print(f"  Horizontal / vertical / slant: {dh:.2f} / {d[2]:.2f} / {np.linalg.norm(d):.2f} m")
+    print(f"  Launch elevation {s['el']:.2f} deg; line of sight {los_el:.2f} deg; holdover {s['el'] - los_el:.2f} deg")
+    print(f"  Launch azimuth (initial direction of projectile) {s['aim']:.2f} grid = {(s['aim'] + a.grid_to_true_deg) % 360:.2f} true;"
+          f" flight time {s['t']:.3f} s")
+    sa = math.degrees(math.atan2(d[0], d[1])) % 360.0                    # straight line, firing point to strike point
+    print(f"  Launch to strike azimuth (firing point to strike point) {sa:.2f} grid = {(sa + a.grid_to_true_deg) % 360:.2f} true")
+    print(f"  Drop below line of departure at the strike point: {dh * math.tan(math.radians(s['el'])) - d[2]:.2f} m")
+    pb, pe = direction(s["vp"]); bb, be = direction(v_b)
+    print(f"  Arrival: {np.linalg.norm(s['vp']):.1f} m/s, azimuth {pb:.1f} grid, elevation {pe:+.2f} deg")
+    print(f"  Blade element: {np.linalg.norm(v_b):.1f} m/s, azimuth {bb:.1f} grid, elevation {be:+.2f} deg")
+    print("RELATIVE VELOCITY IN BLADE AXES")
+    print(f"  span (tip->root) {float(vs):.1f}, chord (LE->TE) {float(vc):.1f}, normal (bottom->top) {float(vn):.1f} m/s;"
+          f" |v_rel| {np.linalg.norm(vrel):.1f} m/s")
+    if a.angle_reading == "projected":
+        print(f"  Projectile strikes rotor blade at {float(F1):.3f} deg to leading edge (plan), {float(F2):.3f} deg"
+              f" to surface of the blade (section). Targets {P}, {S} ({src}).\n")
+    else:
+        print(f"  Projectile strikes rotor blade at {float(F1):.3f} deg to leading edge (3-D), {float(F2):.3f} deg"
+              f" to the blade's chord plane (3-D). Targets {P}, {S} ({src}).\n")
+
+    print(f"DRAG BRACKET (air density {a.air_density:.3f} kg/m^3)")
+    spread = {"drag": [], "height": [], "angles": [(az, pitch)]}      # results kept for the summary at the end
+    for cdv in (0.0, a.cd_min, cd_mid, a.cd_max):
+        r = solve_strike(build_cfg(a, cd=cdv), P, S)
+        spread["drag"].append(r and (r["az"], r["pitch"]))
+        lab = "vacuum" if cdv == 0 else f"Cd {cdv:.3f}"
+        if cdv == cfg["cd"]:
+            lab += " *"                                              # the case printed in full above
+        print(f"  {lab:10s}: " + (f"rotor blade bearing {r['az']:.2f}, pitch {r['pitch']:.2f};"
+                                   f" projectile arrival {np.linalg.norm(r['vp']):.1f} m/s,"
+                                   f" az {direction(r['vp'])[0]:.2f} deg grid, el {direction(r['vp'])[1]:+.2f} deg,"
+                                   f" launch el {r['el']:.2f} deg, flight {r['t']:.3f} s"
+                                   if r else "no solution"))
+        if r:
+            # Two directions from the firing point.  The launch azimuth (as in TRAJECTORY) is where the round
+            # is sent: it carries any allowance for wind drift.  The launch to strike azimuth is the straight
+            # line to the strike point (not the arrival azimuth, which is the projectile's direction there), the geometry the blade angles are worked from.  In calm air the trajectory
+            # stays in one vertical plane and the two are the same; with wind they differ by the drift
+            # allowance.  Both move round as drag moves the strike point.
+            dt_ = r["target"] - cfg["gun"]
+            sb = math.degrees(math.atan2(dt_[0], dt_[1])) % 360.0
+            print(f"{ind}projectile launch azimuth {r['aim']:.2f} grid ({(r['aim'] + a.grid_to_true_deg) % 360:.2f} true)")
+            print(f"{ind}launch to strike azimuth {sb:.2f} grid ({(sb + a.grid_to_true_deg) % 360:.2f} true)")
+            print(f"{ind}horiz./vert./slant: {math.hypot(dt_[0], dt_[1]):.2f} / {dt_[2]:.2f} / {np.linalg.norm(dt_):.2f} m")
+            print(f"{ind}strike point MGRS {mgrs(a.helo_e + r['target'][0], a.helo_n + r['target'][1])} (1 m)")
+    print(f"{ind}* printed in full above")
+    if a.wind_kt:
+        print(f"{ind}(launch azimuths include the allowance for wind drift;")
+        print(f"{ind} launch to strike azimuths are the straight line,")
+        print(f"{ind} firing point to strike point)")
+    print()
+
+    print(f"SENSITIVITY: firing-point altitude +/- {a.gun_alt_tol:.0f} m ({case})")
+    for dz in (-a.gun_alt_tol, 0.0, a.gun_alt_tol):
+        r = solve_strike(build_cfg(a, gun_alt=a.gun_alt + dz, cd=cfg["cd"]), P, S)
+        spread["height"].append(r and (r["az"], r["pitch"]))
+        print(f"  {a.gun_alt + dz:7.1f} m AMSL -> " + (f"bearing {r['az']:.2f}, pitch {r['pitch']:.2f}" if r else "no solution"))
+    print(f"SENSITIVITY: JCAT angles +/- {a.angle_tol:g} deg ({case};")
+    print(f"{ind}the author's tolerance: JCAT gives none)")
+    for dp, ds in ((-a.angle_tol, 0), (a.angle_tol, 0), (0, -a.angle_tol), (0, a.angle_tol)):
+        r = solve_strike(cfg, P + dp, S + ds)
+        spread["angles"].append(r and (r["az"], r["pitch"]))
+        print(f"  planform {P + dp:5.1f}, section {S + ds:5.1f} -> " + (f"bearing {r['az']:.2f}, pitch {r['pitch']:.2f}" if r else "no solution"))
+    if a.attitude_tol:
+        # Opt-in: JCAT records the attitude as unknown, so there is no source tolerance to test against.
+        # The range is the reader's choice (--attitude-tol); each axis is tilted on its own about the
+        # case's own attitude (level by default), as in the validation document's attitude tables.
+        spread["attitude"] = [(az, pitch)]
+        print(f"SENSITIVITY: disc attitude +/- {a.attitude_tol:g} deg ({case};")
+        print(f"{ind}illustrative range: JCAT records the attitude as unknown)")
+        for key, lab, pos, neg in (("pitch_att", "pitch", "nose up", "nose down"),
+                                   ("roll", "roll", "right wing down", "left wing down")):
+            base_att = getattr(a, key)
+            for sgn in (-1.0, 1.0):
+                x = base_att + sgn * a.attitude_tol
+                r = solve_strike(build_cfg(a, cd=cfg["cd"], **{key: x}), P, S)
+                spread["attitude"].append(r and (r["az"], r["pitch"]))
+                word = pos if x > 0 else (neg if x < 0 else "level")
+                print(f"  {lab:5s} {abs(x):4.1f} {word:15s} -> " + (f"bearing {r['az']:.2f}, pitch {r['pitch']:.2f}" if r else "no solution"))
+    what_moves_it(a, spread)
+
+
+def what_moves_it(a, spread):
+    """Say in words which of the checks above moves the answer most, from this run's own results.
+
+    For each source (the author's tolerance on JCAT's angles, firing-point altitude,
+    drag) the spread is the range, max minus min, of the blade bearing and of the pitch
+    over the solves that found a solution.  Printed so that a reader, or a summary of the output, cannot mistake the
+    small drag effect for the whole uncertainty.
+    """
+    labels = {"angles": f"JCAT angles +/- {a.angle_tol:g} deg +",
+              "height": f"Firing-point altitude +/- {a.gun_alt_tol:g} m",
+              "drag": f"Drag, Cd 0 to {a.cd_max:.2f}",
+              "attitude": f"Disc attitude +/- {a.attitude_tol:g} deg *"}
+    rows = {}
+    print("WHAT MOVES THE ANSWER (spread across the checks above: blade bearing / pitch)")
+    for key in [k for k in ("angles", "height", "drag", "attitude") if k in spread]:
+        got = [x for x in spread[key] if x]
+        missing = len(spread[key]) - len(got)
+        note = f"; {missing} of {len(spread[key])} had no solution" if missing else ""
+        if len(got) < 2:
+            print(f"  {labels[key]:30s}: not enough solutions to measure{note}")
+            continue
+        azs, pis = [g[0] for g in got], [g[1] for g in got]
+        rows[key] = (max(azs) - min(azs), max(pis) - min(pis))
+        extra = (f"  (bearing {min(azs):.1f} to {max(azs):.1f}, pitch {min(pis):.1f} to {max(pis):.1f})"
+                 if key == "angles" else "")
+        print(f"  {labels[key]:30s}: {rows[key][0]:4.1f} / {rows[key][1]:4.1f} deg{extra}{note}")
+    print("    + the author's tolerance, not JCAT's:")
+    print("      JCAT gives the angles as approximate")
+    if "attitude" in spread:
+        print("    * illustrative range, not a source tolerance:")
+        print("      JCAT records the attitude as unknown")
+    else:
+        print(f"  {'Disc attitude':30s}: not tested (JCAT: unknown);")
+        print(f"  {'':30s}  try --attitude-tol 2.5")
+    if rows:
+        top_az = max(rows, key=lambda k: rows[k][0]); top_pi = max(rows, key=lambda k: rows[k][1])
+        name = {"angles": "the author's tolerance on JCAT's angles", "height": "the firing-point altitude", "drag": "drag",
+                "attitude": "the disc attitude (illustrative range)"}
+        if top_az == top_pi:
+            print(f"  -> {name[top_az][0].upper() + name[top_az][1:]} moves both blade bearing and pitch most."
+                  " The Monte Carlo (--mc 200) combines them.")
+        else:
+            print(f"  -> {name[top_az][0].upper() + name[top_az][1:]} moves blade bearing most; {name[top_pi]} moves pitch most."
+                  " The Monte Carlo (--mc 200) combines them.")
+
+
+TRY_IT = """
+TRY CHANGING THE INPUTS (add to the command)
+  --gun-alt 2022       firing point on the ground
+                       (default turret, 2030 m)
+  --round OG-7VM       slower round (or OG-7VMZ)
+  --planform-angle 17 --section-angle 38
+                       JCAT's angles, each moved 2 deg
+                       (author's tolerance +/-2.5)
+  --angle-tol 5        wider angle tolerance, allowing
+                       for measurement error
+  --helo-alt 2060.7    hit at 150 ft AGL
+                       (100 ft: 2045.5; default 125 ft)
+  --descent 5.04       rate of descent, m/s (4.15-5.63)
+  --wind-kt 5          JCAT's recorded wind, from 100 T
+  --attitude-tol 2.5   disc tilt, pitch and roll
+                       (illustrative; JCAT: unknown)
+  --vacuum             the drag-free case in full
+  --mc 200             all the tolerances at once
+Example: python3 ex17_blade_strike_check_v4.py --gun-alt 2022
+Every option, its default and its source: --help
+(or get_args() near the top of the code)"""
+
+
+# ----------------------------------------------------------------------------
+# 6. Monte Carlo: how do the tolerances combine?
+# ----------------------------------------------------------------------------
+def monte_carlo(a):
+    """Sample every uncertain input at once and report the joint spread.
+
+    Uniform ranges throughout (the inputs carry tolerances, not
+    distributions), so intervals are "at least this wide", not formal
+    confidence intervals.  The Monte Carlo always uses the drag model, with Cd
+    uniform over [cd-min, cd-max].  Every sample goes through find_roots, the
+    same azimuth scan as a single solve (no starting guess), and keeps its
+    highest-pitch solution.
+    """
+    rng = np.random.default_rng(a.seed)
+    n = a.mc
+    U = lambda lo, hi: rng.uniform(lo, hi, n)
+    P, S = a.planform_angle, a.section_angle
+    planform = U(P - a.angle_tol, P + a.angle_tol)                # draw order kept from v3
+    section = U(S - a.angle_tol, S + a.angle_tol)
+    gun_alt = U(a.gun_alt - a.gun_alt_tol, a.gun_alt + a.gun_alt_tol)
+    helo_alt = U(a.helo_alt - a.helo_alt_tol, a.helo_alt + a.helo_alt_tol)
+    v0 = U(a.v0 - a.v0_tol, a.v0 + a.v0_tol)
+    cd = U(a.cd_min, a.cd_max)
+    pitch_att = U(-a.attitude_tol, a.attitude_tol); roll = U(-a.attitude_tol, a.attitude_tol)
+    airspeed = U(a.speed_kt - a.airspeed_tol_kt, a.speed_kt + a.airspeed_tol_kt)
+    wind_kt = np.clip(U(a.wind_kt - a.wind_tol_kt, a.wind_kt + a.wind_tol_kt), 0.0, None)
+
+    cfgs = [build_cfg(a, gun_alt=gun_alt[i], helo_alt=helo_alt[i], pitch_att=pitch_att[i], roll=roll[i],
+                      cd=cd[i], airspeed_kt=airspeed[i], wind_kt=wind_kt[i], v0=v0[i]) for i in range(n)]
+    roots, unresolved = find_roots(cfgs, planform, section, top_only=True)
+    ok = np.array([bool(r) for r in roots])
+    az = np.array([r[0][0] if r else np.nan for r in roots])
+    pi = np.array([r[0][1] if r else np.nan for r in roots])
+
+    print(f"\nMONTE CARLO: {n} samples, {(~ok).sum()} with no solution ({100 * (~ok).mean():.1f}%)")
+    print(f"  inputs varied (uniform): JCAT angles +/-{a.angle_tol:g} deg (author's tolerance), firing point alt +/-{a.gun_alt_tol:.0f} m,"
+          f" helo alt +/-{a.helo_alt_tol:.0f} m,")
+    print(f"  launch speed +/-{a.v0_tol:.0f} m/s, Cd {a.cd_min:.2f}-{a.cd_max:.2f} (drag always on), air density {a.air_density:.3f},"
+          f" airspeed +/-{a.airspeed_tol_kt:.0f} kt, wind {max(a.wind_kt - a.wind_tol_kt, 0):.1f}-{a.wind_kt + a.wind_tol_kt:.1f} kt"
+          f" from {a.wind_from_deg:.0f}, disc attitude +/-{a.attitude_tol:.0f} deg")
+    print("  every sample solved by the blade-bearing scan (no starting guess), highest-pitch solution kept"
+          + (f"; {unresolved} candidate(s) near a fold could not be confirmed" if unresolved else ""))
+    if not ok.any():
+        print("  no sample has a solution")
+        return az, pi, ok
+    # Azimuth is circular: unwrap around the circular mean so percentiles do not break at 0/360.
+    # Circular mean = atan2(mean of sines, mean of cosines): average the unit vectors, take their direction.
+    ref = math.degrees(math.atan2(np.sin(np.radians(az[ok])).mean(), np.cos(np.radians(az[ok])).mean()))
+    az_u = ref + _wrap(az - ref)
+    if (az_u[ok] < 0).any() or (az_u[ok] >= 360).any():
+        print("  (bearings unwrapped around their circular mean; values below 0 or above 360 are read modulo 360)")
+    for name, x in (("bearing (deg stbd of nose)", az_u[ok]), ("pitch (deg LE up)", pi[ok])):
+        # Empirical percentiles: sort the samples; the p-th percentile is the value p% of the way up the
+        # sorted list (numpy interpolates linearly between neighbours).  No distribution is assumed:
+        # the outputs are not Gaussian, so these are not mean +/- k sigma intervals.
+        q = np.percentile(x, [2.5, 5, 25, 50, 75, 95, 97.5])
+        print(f"  {name:28s} median {q[3]:6.1f} | 50% {q[2]:6.1f}..{q[4]:6.1f} | 90% {q[1]:6.1f}..{q[5]:6.1f} | 95% {q[0]:6.1f}..{q[6]:6.1f}")
+    # Pearson correlation coefficient, covariance / (sd_az sd_pitch) (Riley, Hobson & Bence, 3rd ed., ch. 30, p. 1200)
+    print(f"  bearing-pitch correlation: {np.corrcoef(az_u[ok], pi[ok])[0, 1]:+.2f}")
+    print("  (draws with no solution describe a strike no blade orientation could produce; they count against the"
+          " input ranges, and they censor the high-bearing side, so the median can sit below the nominal solution)")
+    return az, pi, ok
+
+
+if __name__ == "__main__":
+    args = get_args()
+    report(args)
+    if args.mc > 0:
+        monte_carlo(args)
+    print(TRY_IT)
